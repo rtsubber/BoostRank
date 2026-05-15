@@ -77,6 +77,30 @@ def init_db():
                 issues_json TEXT NOT NULL DEFAULT '[]',
                 page_data_json TEXT NOT NULL DEFAULT '{}',
                 source TEXT NOT NULL DEFAULT 'web' CHECK(source IN ('web', 'api', 'compare', 'report')),
+                ip_address TEXT,
+                user_agent TEXT,
+                response_time_ms INTEGER,
+                created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS usage_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_id TEXT,
+                endpoint TEXT NOT NULL,
+                url TEXT,
+                ip_address TEXT,
+                user_agent TEXT,
+                status_code INTEGER DEFAULT 200,
+                response_time_ms REAL,
+                created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS signups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                tier TEXT NOT NULL DEFAULT 'free',
+                ip_address TEXT,
+                user_agent TEXT,
                 created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
             );
 
@@ -94,7 +118,23 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_audit_history_user ON audit_history(user_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_audit_history_url ON audit_history(url);
             CREATE INDEX IF NOT EXISTS idx_rate_limits_user_action ON rate_limits(user_id, action_type, window_start);
+            CREATE INDEX IF NOT EXISTS idx_usage_logs_created ON usage_logs(created_at);
+            CREATE INDEX IF NOT EXISTS idx_signups_created ON signups(created_at);
         """)
+
+        # Migrations: add columns to existing tables if they don't exist
+        try:
+            conn.execute("ALTER TABLE audit_history ADD COLUMN ip_address TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            conn.execute("ALTER TABLE audit_history ADD COLUMN user_agent TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE audit_history ADD COLUMN response_time_ms INTEGER")
+        except sqlite3.OperationalError:
+            pass
     finally:
         conn.close()
 
@@ -251,7 +291,8 @@ def increment_rate_limit(user_id: int, action_type: str):
 
 def save_audit(user_id: int | None, api_key_id: int | None, url: str,
                seo_score: int, scores: dict, issues: list, page_data: dict,
-               source: str = "web") -> int:
+               source: str = "web", ip_address: str | None = None,
+               user_agent: str | None = None, response_time_ms: int | None = None) -> int:
     """Save an audit to history. Returns audit ID."""
     import json
 
@@ -259,13 +300,44 @@ def save_audit(user_id: int | None, api_key_id: int | None, url: str,
     try:
         cursor = conn.execute(
             """INSERT INTO audit_history
-               (user_id, api_key_id, url, seo_score, scores_json, issues_json, page_data_json, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (user_id, api_key_id, url, seo_score, scores_json, issues_json, page_data_json, source, ip_address, user_agent, response_time_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user_id, api_key_id, url, seo_score,
-             json.dumps(scores), json.dumps(issues), json.dumps(page_data), source),
+             json.dumps(scores), json.dumps(issues), json.dumps(page_data), source,
+             ip_address, user_agent, response_time_ms),
         )
         conn.commit()
         return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def log_usage(endpoint: str, url: str | None = None, key_id: str | None = None,
+              ip_address: str | None = None, user_agent: str | None = None,
+              status_code: int = 200, response_time_ms: float | None = None):
+    """Log an API call for monitoring."""
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO usage_logs (key_id, endpoint, url, ip_address, user_agent, status_code, response_time_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (key_id, endpoint, url, ip_address, user_agent, status_code, response_time_ms),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_signup(email: str, tier: str = "free", ip_address: str | None = None, user_agent: str | None = None):
+    """Log a user signup for monitoring."""
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO signups (email, tier, ip_address, user_agent)
+               VALUES (?, ?, ?, ?)""",
+            (email, tier, ip_address, user_agent),
+        )
+        conn.commit()
     finally:
         conn.close()
 

@@ -13,7 +13,7 @@ from typing import Optional
 
 from app.database import (
     check_rate_limit, increment_rate_limit, save_audit,
-    get_db, TIER_LIMITS,
+    log_usage, log_signup, get_db, TIER_LIMITS,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["AI Agent API"])
@@ -141,6 +141,7 @@ async def agent_audit(request: AgentAuditRequest, req: Request, response: Respon
     Pro: 1,000/month (API key)
     Agency: 10,000/month (API key)
     """
+    start_time = time.time()
     auth = authenticate_api_key(req)
 
     if auth:
@@ -265,6 +266,21 @@ async def agent_audit(request: AgentAuditRequest, req: Request, response: Respon
     recommendations = _generate_recommendations(scores, all_issues)
 
     # Save audit
+    # Get request metadata for tracking
+    audit_ip = req.headers.get("x-forwarded-for", req.headers.get("x-real-ip", req.client.host if req.client else "0.0.0.0")).split(",")[0].strip()
+    audit_ua = req.headers.get("user-agent", "")[:500]
+
+    # Log usage for monitoring
+    log_usage(
+        endpoint="api_audit",
+        url=url,
+        key_id=str(auth["api_key_id"]) if auth else None,
+        ip_address=audit_ip,
+        user_agent=audit_ua,
+        status_code=200,
+        response_time_ms=round((time.time() - start_time) * 1000) if 'start_time' in dir() else None,
+    )
+
     if request.detail_level == "full":
         # Use -1 for anonymous users to avoid NULL FK issues
         save_audit(
@@ -272,6 +288,8 @@ async def agent_audit(request: AgentAuditRequest, req: Request, response: Respon
             url=url, seo_score=scores["total"],
             scores=scores, issues=all_issues, page_data=page_data,
             source="api",
+            ip_address=audit_ip, user_agent=audit_ua,
+            response_time_ms=round((time.time() - start_time) * 1000) if 'start_time' in dir() else None,
         )
 
     # Format issues based on detail level

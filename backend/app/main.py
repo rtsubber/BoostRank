@@ -12,6 +12,7 @@ Features:
 - Stripe billing integration
 """
 
+import os
 import time
 from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Query, Depends, Request, Response
@@ -32,6 +33,7 @@ from app.waitlist import router as waitlist_router
 from app.database import (
     init_db, get_db, check_rate_limit, increment_rate_limit,
     save_audit, get_user_audits, get_audit_by_id, TIER_LIMITS,
+    log_signup, log_usage,
 )
 from app.auth import (
     signup, login, create_api_key, list_api_keys, revoke_api_key,
@@ -133,9 +135,12 @@ async def auth_signup(request: SignupRequest, req: Request):
     """Register a new user account."""
     # Rate limit signups by IP
     client_ip = _get_client_ip(req)
+    user_agent = req.headers.get("user-agent", "")[:500]
     if not _check_signup_rate(client_ip):
         raise HTTPException(status_code=429, detail="Signup rate limit exceeded. Try again later.")
     result = signup(request)
+    # Log signup for monitoring
+    log_signup(email=request.email, tier="free", ip_address=client_ip, user_agent=user_agent)
     return result
 
 
@@ -325,6 +330,133 @@ app.include_router(reports_router)
 app.include_router(billing_router)
 app.include_router(agent_api_router)
 app.include_router(waitlist_router)
+
+
+# --- Admin Monitoring ---
+
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "REDACTED_ADMIN_KEY")
+
+
+@app.get("/api/admin/stats")
+async def admin_stats(
+    days: int = 7,
+    admin_key: str = Query(..., alias="key"),
+):
+    """Admin dashboard: usage stats, abuse monitoring."""
+    if admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    conn = get_db()
+    now = time.time()
+    since = now - (days * 86400)
+
+    # Total audits
+    total_audits = conn.execute(
+        "SELECT COUNT(*) FROM audit_history WHERE created_at >= ?", (since,)
+    ).fetchone()[0]
+
+    # Audits by source
+    by_source = dict(conn.execute(
+        "SELECT source, COUNT(*) FROM audit_history WHERE created_at >= ? GROUP BY source",
+        (since,)
+    ).fetchall())
+
+    # Audits by day
+    by_day = []
+    rows = conn.execute(
+        """SELECT date(created_at, 'unixepoch') as day, COUNT(*) as count
+           FROM audit_history WHERE created_at >= ?
+           GROUP BY day ORDER BY day""",
+        (since,)
+    ).fetchall()
+    for r in rows:
+        by_day.append({"date": r[0], "count": r[1]})
+
+    # Top URLs audited
+    top_urls = []
+    rows = conn.execute(
+        "SELECT url, COUNT(*) as cnt FROM audit_history WHERE created_at >= ? GROUP BY url ORDER BY cnt DESC LIMIT 10",
+        (since,)
+    ).fetchall()
+    for r in rows:
+        top_urls.append({"url": r[0], "count": r[1]})
+
+    # Unique IPs
+    unique_ips = conn.execute(
+        "SELECT COUNT(DISTINCT ip_address) FROM audit_history WHERE created_at >= ? AND ip_address IS NOT NULL",
+        (since,)
+    ).fetchone()[0]
+
+    # Suspicious IPs (5+ audits in a day)
+    suspicious_ips = []
+    rows = conn.execute(
+        """SELECT ip_address, COUNT(*) as cnt FROM audit_history
+           WHERE created_at >= ? AND ip_address IS NOT NULL
+           GROUP BY ip_address HAVING cnt >= 20
+           ORDER BY cnt DESC LIMIT 10""",
+        (since,)
+    ).fetchall()
+    for r in rows:
+        suspicious_ips.append({"ip": r[0], "count": r[1]})
+
+    # Usage logs
+    usage_count = conn.execute(
+        "SELECT COUNT(*) FROM usage_logs WHERE created_at >= ?", (since,)
+    ).fetchone()[0]
+
+    # Recent usage
+    recent_usage = []
+    rows = conn.execute(
+        """SELECT endpoint, url, ip_address, user_agent, status_code, created_at
+           FROM usage_logs WHERE created_at >= ?
+           ORDER BY created_at DESC LIMIT 20""",
+        (since,)
+    ).fetchall()
+    for r in rows:
+        recent_usage.append({
+            "endpoint": r[0], "url": r[1][:80] if r[1] else None,
+            "ip": r[2], "user_agent": (r[3] or "")[:60],
+            "status": r[4], "time": r[5],
+        })
+
+    # Signups
+    total_signups = conn.execute(
+        "SELECT COUNT(*) FROM signups WHERE created_at >= ?", (since,)
+    ).fetchone()[0]
+
+    signup_ips = conn.execute(
+        """SELECT ip_address, COUNT(*) as cnt FROM signups
+           WHERE created_at >= ? AND ip_address IS NOT NULL
+           GROUP BY ip_address HAVING cnt >= 3
+           ORDER BY cnt DESC LIMIT 10""",
+        (since,)
+    ).fetchall()
+    suspicious_signups = [{"ip": r[0], "count": r[1]} for r in signup_ips]
+
+    conn.close()
+
+    return {
+        "period_days": days,
+        "audits": {
+            "total": total_audits,
+            "by_source": by_source,
+            "by_day": by_day,
+            "top_urls": top_urls,
+            "unique_ips": unique_ips,
+        },
+        "usage": {
+            "total_calls": usage_count,
+            "recent": recent_usage,
+        },
+        "signups": {
+            "total": total_signups,
+            "suspicious_ips": suspicious_signups,
+        },
+        "abuse": {
+            "suspicious_ips": suspicious_ips,
+            "note": "IPs with 20+ audits in period — potential abuse",
+        },
+    }
 
 
 # --- Health & Info ---

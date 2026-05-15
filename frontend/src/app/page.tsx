@@ -136,7 +136,7 @@ export default function Home() {
       </nav>
 
       {/* Hero */}
-      <section className="pt-32 pb-16 px-4">
+      <section id="audit" className="pt-32 pb-16 px-4">
         <div className="max-w-4xl mx-auto text-center">
           <h1 className="text-5xl md:text-6xl font-bold mb-4 fade-up">
             Your store&apos;s SEO{" "}
@@ -444,7 +444,7 @@ export default function Home() {
                   "Chrome extension",
                 ],
                 cta: "Start Free",
-                href: "#hero",
+                href: "#audit",
                 highlight: false,
               },
               {
