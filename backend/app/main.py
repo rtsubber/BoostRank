@@ -15,7 +15,8 @@ Features:
 import os
 import time
 from collections import defaultdict
-from fastapi import FastAPI, HTTPException, Query, Depends, Request, Response
+import hmac
+from fastapi import FastAPI, HTTPException, Query, Depends, Request, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, HttpUrl
@@ -334,17 +335,36 @@ app.include_router(waitlist_router)
 
 # --- Admin Monitoring ---
 
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "REDACTED_ADMIN_KEY")
+# No hardcoded fallback. If unset, admin routes fail closed (503) rather than
+# accepting a publicly-known default key.
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
+if not ADMIN_API_KEY:
+    import logging
+    logging.getLogger("boostrank").warning(
+        "ADMIN_API_KEY is not set — admin endpoints are disabled until it is configured."
+    )
+
+
+def require_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
+    """Authenticate an admin request.
+
+    The key is read from a request header (never the URL query string, which
+    would leak it into logs, browser history, and Referer headers) and compared
+    in constant time to avoid a timing side channel.
+    """
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=503, detail="Admin access not configured")
+    if not hmac.compare_digest(x_admin_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return True
 
 
 @app.get("/api/admin/stats")
 async def admin_stats(
     days: int = 7,
-    admin_key: str = Query(..., alias="key"),
+    _admin: bool = Depends(require_admin),
 ):
     """Admin dashboard: usage stats, abuse monitoring."""
-    if admin_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=403, detail="Admin access required")
 
     conn = get_db()
     now = time.time()
