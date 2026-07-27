@@ -302,6 +302,23 @@ export default function Home() {
               </div>
             </div>
 
+            {/* Fix It CTA */}
+            <div className="bg-gradient-to-r from-[#22c55e]/10 to-[#0f172a] rounded-2xl border border-[#22c55e]/30 p-6 mt-6">
+              <div className="flex flex-col md:flex-row items-center gap-4">
+                <div className="text-4xl">🔧</div>
+                <div className="flex-1 text-center md:text-left">
+                  <h3 className="text-lg font-bold mb-1">Want us to fix these issues?</h3>
+                  <p className="text-sm text-slate-400">We fix meta tags, schema markup, OG tags, and more — just like we do for our own sites. One-time fix or ongoing SEO management.</p>
+                </div>
+                <a
+                  href={`/fix?score=${result.seo_score}&url=${encodeURIComponent(result.url)}`}
+                  className="px-6 py-3 rounded-xl bg-[#22c55e] text-black font-semibold hover:bg-[#16a34a] transition whitespace-nowrap cursor-pointer"
+                >
+                  Fix My Site →
+                </a>
+              </div>
+            </div>
+
             {/* Page Data Summary */}
             <div className="bg-[#1e293b] rounded-2xl border border-white/10 p-6 mt-6">
               <h3 className="text-lg font-semibold mb-4">Page Data</h3>
