@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const API_BASE = "https://sublime-illumination-production-5373.up.railway.app";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "https://boostrank.co";
 
 export async function POST(request: NextRequest) {
   try {

@@ -51,7 +51,7 @@ export default function Home() {
 
       if (!res.ok) {
         // If proxy fails, try direct Railway API
-        const fallbackRes = await fetch("https://sublime-illumination-production-5373.up.railway.app/api/audit", {
+        const fallbackRes = await fetch(`${process.env.NEXT_PUBLIC_API_BASE || "https://boostrank.co"}/api/audit`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url: auditUrl }),
