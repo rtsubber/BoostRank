@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, HttpUrl
 from typing import Optional
 from app.database import get_db, init_db
+from dataclasses import asdict
 
 router = APIRouter(prefix="/api/fix-orders", tags=["fix-orders"])
 
@@ -66,6 +67,18 @@ def init_fix_orders_table():
             CREATE INDEX IF NOT EXISTS idx_fix_orders_token ON fix_orders(order_token);
             CREATE INDEX IF NOT EXISTS idx_fix_orders_email ON fix_orders(email);
             CREATE INDEX IF NOT EXISTS idx_fix_orders_status ON fix_orders(status);
+
+            CREATE TABLE IF NOT EXISTS fix_promo_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                description TEXT,
+                max_uses INTEGER,
+                uses INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
+                expires_at REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_promo_code ON fix_promo_codes(code);
         """)
         conn.commit()
     finally:
@@ -129,6 +142,66 @@ async def get_fix_plans():
         },
     }
     return {"plans": plans}
+
+
+@router.post("/redeem")
+async def redeem_fix_code(request: Request):
+    """Redeem a promo code to create a paid fix order without going through Stripe.
+    
+    Used for testing, internal use, and promotional giveaways.
+    Valid promo codes are stored in the fix_promo_codes table.
+    """
+    body = await request.json()
+    email = body.get("email", "").strip()
+    url = body.get("url", "").strip()
+    code = body.get("code", "").strip().upper()
+    product_type = body.get("product_type", "one_time_fix")
+
+    if not email or not url or not code:
+        raise HTTPException(status_code=400, detail="email, url, and code are required")
+
+    if product_type not in ("one_time_fix", "seo_subscription"):
+        raise HTTPException(status_code=400, detail="Invalid product_type")
+
+    # Validate promo code
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM fix_promo_codes WHERE code = ? AND (max_uses IS NULL OR uses < max_uses)",
+        (code,),
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Invalid or expired promo code")
+
+    # Create order with promo code
+    order_token = f"bfx_{secrets.token_urlsafe(24)}"
+
+    cursor = conn.execute(
+        """INSERT INTO fix_orders
+           (order_token, email, url, product_type, status, seo_score_before,
+            issues_json, site_platform, paid_at)
+           VALUES (?, ?, ?, ?, 'paid', 0, '[]', NULL, strftime('%s','now'))""",
+        (order_token, email, url, product_type),
+    )
+
+    # Increment promo code uses
+    conn.execute(
+        "UPDATE fix_promo_codes SET uses = uses + 1 WHERE code = ?",
+        (code,),
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "order_token": order_token,
+        "status": "paid",
+        "url": url,
+        "email": email,
+        "product_type": product_type,
+        "message": "Promo code redeemed! Your SEO audit will begin shortly.",
+        "result_url": f"/api/fix-orders/result/{order_token}",
+    }
 
 
 @router.post("/checkout")
@@ -273,17 +346,89 @@ async def fix_order_webhook(request: Request):
             finally:
                 conn.close()
 
-            # TODO: Trigger fix generation — call the AI fix engine
-            # For now, mark as processing
-            conn = get_db()
-            try:
-                conn.execute(
-                    "UPDATE fix_orders SET status = 'processing' WHERE order_token = ?",
-                    (order_token,),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+            # Trigger the AI fix engine — runs in background so webhook returns quickly
+            import logging
+            import asyncio
+            from app.fix_engine import run_full_audit, generate_fixes
+            from app.fix_engine.fix_generator import format_fix_package_json
+
+            # Fetch order URL for the background task
+            _conn = get_db()
+            _order = _conn.execute(
+                "SELECT url FROM fix_orders WHERE order_token = ?",
+                (order_token,),
+            ).fetchone()
+            _conn.close()
+
+            if _order:
+                _order_url = _order["url"]
+
+                async def _process_fix_order(_token: str, _url: str):
+                    """Background task: run audit → generate fixes → update order."""
+                    logger = logging.getLogger("boostrank")
+                    try:
+                        logger.info(f"Starting fix generation for order {_token}, URL: {_url}")
+
+                        # Mark as processing
+                        _c = get_db()
+                        _c.execute(
+                            "UPDATE fix_orders SET status = 'processing' WHERE order_token = ?",
+                            (_token,),
+                        )
+                        _c.commit()
+                        _c.close()
+
+                        # Run the same deep SEO audit we use manually
+                        audit_result = await run_full_audit(_url)
+                        logger.info(f"Audit complete for {_url}: score {audit_result.seo_score}/100, {len(audit_result.issues)} issues found")
+
+                        # Update order with SEO score before fix
+                        _c = get_db()
+                        _c.execute(
+                            "UPDATE fix_orders SET seo_score_before = ? WHERE order_token = ?",
+                            (audit_result.seo_score, _token),
+                        )
+                        _c.commit()
+                        _c.close()
+
+                        # Generate AI fixes (Claude generates corrected code per issue)
+                        fix_package = await generate_fixes(audit_result, _token)
+                        logger.info(f"Fixes generated: {fix_package.total_fixes} fixes, estimated score {fix_package.seo_score_after}/100")
+
+                        # Update order — mark completed with all fix data
+                        _c = get_db()
+                        _c.execute(
+                            """UPDATE fix_orders
+                               SET status = 'completed',
+                                   seo_score_after = ?,
+                                   issues_json = ?,
+                                   fixes_json = ?,
+                                   fixed_code_json = ?,
+                                   completed_at = strftime('%s','now')
+                               WHERE order_token = ?""",
+                            (fix_package.seo_score_after,
+                             json.dumps([asdict(i) for i in audit_result.issues]),
+                             json.dumps([asdict(f) for f in fix_package.fixes]),
+                             json.dumps(format_fix_package_json(fix_package)),
+                             _token),
+                        )
+                        _c.commit()
+                        _c.close()
+
+                        logger.info(f"Fix order {_token} completed successfully")
+
+                    except Exception as e:
+                        logger.error(f"Fix generation failed for {_token}: {e}", exc_info=True)
+                        _c = get_db()
+                        _c.execute(
+                            "UPDATE fix_orders SET status = 'failed' WHERE order_token = ?",
+                            (_token,),
+                        )
+                        _c.commit()
+                        _c.close()
+
+                # Fire and forget — webhook must return 200 quickly to Stripe
+                asyncio.ensure_future(_process_fix_order(order_token, _order_url))
 
     elif event_type == "customer.subscription.created":
         subscription = event["data"]["object"]
@@ -379,3 +524,229 @@ async def admin_mark_complete(order_id: int, request: Request):
         conn.close()
 
     return {"status": "completed", "order_id": order_id}
+
+
+@router.get("/result/{order_token}")
+async def get_fix_result(order_token: str):
+    """Customer endpoint: get the fix result for a paid order.
+    
+    Returns the full fix package including:
+    - Before/after SEO scores
+    - Every issue found with severity
+    - Every fix generated with corrected code
+    - Platform-specific implementation guides
+    - Audit trail report
+    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM fix_orders WHERE order_token = ?",
+            (order_token,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        status = row["status"]
+
+        # If still pending, customer hasn't paid yet
+        if status == "pending":
+            return {
+                "order_token": order_token,
+                "status": "pending",
+                "message": "Payment not yet received. Complete checkout to start your SEO fix.",
+                "url": row["url"],
+            }
+
+        # If processing, fix is being generated
+        if status == "processing":
+            return {
+                "order_token": order_token,
+                "status": "processing",
+                "message": "Your SEO audit is running and fixes are being generated. This typically takes 30-60 seconds.",
+                "url": row["url"],
+                "seo_score_before": row["seo_score_before"],
+            }
+
+        # If failed, something went wrong
+        if status == "failed":
+            return {
+                "order_token": order_token,
+                "status": "failed",
+                "message": "Something went wrong generating your fixes. Our team has been notified and will resolve this shortly.",
+                "url": row["url"],
+            }
+
+        # If completed, return the full fix package
+        if status == "completed":
+            fixed_code = json.loads(row["fixed_code_json"]) if row["fixed_code_json"] else {}
+            issues = json.loads(row["issues_json"]) if row["issues_json"] else []
+            fixes = json.loads(row["fixes_json"]) if row["fixes_json"] else []
+
+            return {
+                "order_token": order_token,
+                "status": "completed",
+                "url": row["url"],
+                "email": row["email"],
+                "product_type": row["product_type"],
+                "site_platform": row["site_platform"],
+                "seo_score_before": row["seo_score_before"],
+                "seo_score_after": row["seo_score_after"],
+                "score_improvement": (row["seo_score_after"] or 0) - (row["seo_score_before"] or 0),
+                "total_issues": len(issues),
+                "total_fixes": len(fixes),
+                "issues": issues,
+                "fixes": fixes,
+                "fix_package": fixed_code,
+                "created_at": row["created_at"],
+                "paid_at": row["paid_at"],
+                "completed_at": row["completed_at"],
+            }
+
+        # Unknown status
+        return {
+            "order_token": order_token,
+            "status": status,
+            "url": row["url"],
+        }
+    finally:
+        conn.close()
+
+
+@router.post("/trigger/{order_token}")
+async def trigger_fix_generation(order_token: str, request: Request):
+    """Admin endpoint: manually trigger fix generation for an order.
+    
+    Useful for:
+    - Retrying failed orders
+    - Testing the fix engine
+    - Re-running after site changes
+    """
+    admin_key = request.headers.get("X-Admin-Key", "")
+    expected_key = os.getenv("ADMIN_API_KEY", "")
+    if not expected_key or not hmac.compare_digest(admin_key, expected_key):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    import asyncio
+    from app.fix_engine import run_full_audit, generate_fixes
+    from app.fix_engine.fix_generator import format_fix_package_json
+
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM fix_orders WHERE order_token = ?",
+        (order_token,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # Mark as processing
+    conn = get_db()
+    conn.execute(
+        "UPDATE fix_orders SET status = 'processing' WHERE order_token = ?",
+        (order_token,),
+    )
+    conn.commit()
+    conn.close()
+
+    # Run the full audit
+    audit_result = await run_full_audit(row["url"])
+
+    # Update score before
+    conn = get_db()
+    conn.execute(
+        "UPDATE fix_orders SET seo_score_before = ? WHERE order_token = ?",
+        (audit_result.seo_score, order_token),
+    )
+    conn.commit()
+    conn.close()
+
+    # Generate fixes
+    fix_package = await generate_fixes(audit_result, order_token)
+
+    # Update order — mark completed
+    conn = get_db()
+    conn.execute(
+        """UPDATE fix_orders
+           SET status = 'completed',
+               seo_score_after = ?,
+               issues_json = ?,
+               fixes_json = ?,
+               fixed_code_json = ?,
+               completed_at = strftime('%s','now')
+           WHERE order_token = ?""",
+        (fix_package.seo_score_after,
+         json.dumps([asdict(i) for i in audit_result.issues]),
+         json.dumps([asdict(f) for f in fix_package.fixes]),
+         json.dumps(format_fix_package_json(fix_package)),
+         order_token),
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "order_token": order_token,
+        "status": "completed",
+        "url": row["url"],
+        "seo_score_before": audit_result.seo_score,
+        "seo_score_after": fix_package.seo_score_after,
+        "score_improvement": fix_package.seo_score_after - audit_result.seo_score,
+        "total_issues": len(audit_result.issues),
+        "total_fixes": len(fix_package.fixes),
+    }
+
+
+@router.get("/result/{order_token}/email")
+async def get_fix_email(order_token: str, request: Request):
+    """Admin endpoint: get the formatted email for a completed fix order.
+    
+    Returns the HTML email body ready to send via Resend or any email provider.
+    """
+    admin_key = request.headers.get("X-Admin-Key", "")
+    expected_key = os.getenv("ADMIN_API_KEY", "")
+    if not expected_key or not hmac.compare_digest(admin_key, expected_key):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    from app.fix_engine.fix_generator import format_fix_package_email, FixItem, FixPackage
+
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM fix_orders WHERE order_token = ?",
+        (order_token,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if row["status"] != "completed":
+        raise HTTPException(status_code=400, detail=f"Order status is {row['status']}, not completed")
+
+    # Reconstruct fix package from DB
+    fixes = [FixItem(**f) for f in (json.loads(row["fixes_json"]) if row["fixes_json"] else [])]
+    fix_package = FixPackage(
+        order_token=order_token,
+        url=row["url"],
+        platform=row["site_platform"] or "custom",
+        seo_score_before=row["seo_score_before"] or 0,
+        seo_score_after=row["seo_score_after"] or 0,
+        scores_before={},
+        scores_after={},
+        total_issues=len(json.loads(row["issues_json"])) if row["issues_json"] else 0,
+        total_fixes=len(fixes),
+        fixes=fixes,
+    )
+
+    email_data = format_fix_package_email(fix_package)
+
+    # Log delivery in audit trail
+    from app.fix_engine.audit_trail import AuditTrail
+    trail = AuditTrail(order_token, row["url"])
+    trail.log_fix_delivered(
+        delivery_method="api",
+        delivery_target=f"admin/{admin_key[:8]}...",
+        delivery_content=format_fix_package_json(fix_package),
+    )
+
+    return email_data

@@ -30,6 +30,8 @@ from app.analyzers.schema_org import analyze_schema
 from app.analyzers.scoring import calculate_seo_score
 from app.waitlist import router as waitlist_router
 from app.fix_orders import router as fix_orders_router
+from app.shopify_oauth import router as shopify_oauth_router
+from app.shopify_apply import router as shopify_apply_router
 
 # New modules
 from app.database import (
@@ -333,6 +335,8 @@ app.include_router(billing_router)
 app.include_router(agent_api_router)
 app.include_router(waitlist_router)
 app.include_router(fix_orders_router)
+app.include_router(shopify_oauth_router)
+app.include_router(shopify_apply_router)
 
 
 # --- Admin Monitoring ---
